@@ -1,0 +1,6 @@
+## Default command for paired-end data with only adapter contamination
+trim_galore --paired sample_R1.fastq.gz sample_R2.fastq.gz
+
+## Example command if your data needs more aggressive trimming
+## (e.g., slightly lower quality or more variable read quality)
+trim_galore --paired --quality 25 --length 30 sample_R1.fastq.gz sample_R2.fastq.gz

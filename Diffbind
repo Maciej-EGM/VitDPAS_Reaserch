@@ -1,0 +1,138 @@
+library(DiffBind)
+#Read files and create DBA object
+Samples <- read.csv2("/Users/Mariusz/Desktop/THP1_ATAC/samples_DIFFBIND.csv")
+DBA <- dba(sampleSheet = Samples)
+#Compute summits and normalize
+DBA_counts <- dba.count(DBA,summits = 75, bParallel = F)
+DBA_counts <- dba.normalize(DBA_counts, method = DBA_DESEQ2, normalize = DBA_NORM_NATIVE) #there are other normalization options for edgeR and some different ones. You can check various
+
+#compute the comparisions
+{
+  res1  <- dba.contrast(DBA_counts,design = "~Condition", contrast = c("Condition", "VitD","Control"), reorderMeta = list(Condition="Control"))
+  res1 <- dba.analyze(res1, method = DBA_DESEQ2)
+  
+  res2  <- dba.contrast(DBA_counts,design = "~Condition", contrast = c("Condition", "LPS","Control"), reorderMeta = list(Condition="Control"))
+  res2 <- dba.analyze(res2, method = DBA_DESEQ2)
+  
+  res3  <- dba.contrast(DBA_counts,design = "~Condition", contrast = c("Condition", "LPS_VitD","Control"), reorderMeta = list(Condition="Control"))
+  res3 <- dba.analyze(res3, method = DBA_DESEQ2)
+}
+#If Carsten asks you to get normalized counts - this is how you do that. Optional part
+normCounts <- dba.peakset(DBA_counts1, bRetrieve=TRUE, DataType=DBA_DATA_FRAME)
+write.csv2(normCounts1,"countsyTHP1_ATAC.csv")
+
+#plot general PCA on all sites
+dba.plotPCA(DBA_counts, attributes = DBA_CONDITION, vColors = c("#6E6E6E","red3","lightblue","blue3"))
+#get full reports from all analyses
+res1_report <- dba.report(res1,th = 1)
+res2_report <- dba.report(res2,th = 1)
+res3_report <- dba.report(res3,th = 1)
+
+
+
+
+#Meanwhile everything below is how I create the big table
+{
+  FULL_RAPORT_res1 <- dba.report(res1, bNotDB = T, bDB = T)
+  FULL_RAPORT_res1 <- FULL_RAPORT_res1$peaks
+  FULL_RAPORT_res1_db <- FULL_RAPORT_res1[[1]]
+  FULL_RAPORT_res1_db$ID <- rownames(FULL_RAPORT_res1_db)
+  FULL_RAPORT_res1_notdb <- FULL_RAPORT_res1[[2]]
+  FULL_RAPORT_res1_notdb$ID <- rownames(FULL_RAPORT_res1_notdb)
+  
+  #COLUMN_SIG
+  FULL_RAPORT_res1 <- rbind(FULL_RAPORT_res1_db,FULL_RAPORT_res1_notdb)
+  FULL_RAPORT_res1$ID <- as.integer(FULL_RAPORT_res1$ID)
+  
+  FULL_RAPORT_res2 <- dba.report(res2, bNotDB = T, bDB = T)
+  FULL_RAPORT_res2 <- FULL_RAPORT_res2$peaks
+  FULL_RAPORT_res2_db <- FULL_RAPORT_res2[[1]]
+  FULL_RAPORT_res2_db$ID <- rownames(FULL_RAPORT_res2_db)
+  FULL_RAPORT_res2_notdb <- FULL_RAPORT_res2[[2]]
+  FULL_RAPORT_res2_notdb$ID <- rownames(FULL_RAPORT_res2_notdb)
+  #COLUMN_SIG
+  FULL_RAPORT_res2 <- rbind(FULL_RAPORT_res2_db,FULL_RAPORT_res2_notdb)
+  FULL_RAPORT_res2$ID <- as.integer(FULL_RAPORT_res2$ID)
+  
+  FULL_RAPORT_res3 <- dba.report(res3, bNotDB = T, bDB = T)
+  FULL_RAPORT_res3 <- FULL_RAPORT_res3$peaks
+  FULL_RAPORT_res3_db <- FULL_RAPORT_res3[[1]]
+  FULL_RAPORT_res3_db$ID <- rownames(FULL_RAPORT_res3_db)
+  FULL_RAPORT_res3_notdb <- FULL_RAPORT_res3[[2]]
+  FULL_RAPORT_res3_notdb$ID <- rownames(FULL_RAPORT_res3_notdb)
+  #COLUMN_SIG
+  FULL_RAPORT_res3 <- rbind(FULL_RAPORT_res3_db,FULL_RAPORT_res3_notdb)
+  FULL_RAPORT_res3$ID <- as.integer(FULL_RAPORT_res3$ID)
+}  
+###
+
+
+#annotation of consensus peaks. Simply extract all peaks from one full report and annotate them
+library(ChIPseeker)
+ADNOTACJA <- dba.report(res1, th = 1)
+ADNOTACJA <- annotatePeak(ADNOTACJA, tssRegion=c(-3000, 3000),TxDb = TxDb.Hsapiens.UCSC.hg38.knownGene, annoDb="org.Hs.eg.db")
+
+
+
+FR1 <- FULL_RAPORT_res1
+FR2 <- FULL_RAPORT_res2
+FR3 <- FULL_RAPORT_res3
+
+
+master_table_ATAC <- FULL_RAPORT_res1
+Anno <- as.data.frame(ADNOTACJA@anno)
+head(Anno)
+head(FULL_RAPORT_res1)
+Anno <- Anno[,c(4,12,13,14,15,16,17,18,19,20,21,22,23)]
+colnames(FULL_RAPORT_res1) <- c("Chr","Start","End","Score","Conc","Conc_VitD","Conc_Control","Fold_VitD",
+                                "p-value_VitD","FDR_VitD","ID")
+head(Anno)
+Anno$ID <- rownames(Anno)
+master_table_ATAC <- merge(FULL_RAPORT_res1, Anno, by = "ID")
+colnames(master_table_ATAC)
+head(FULL_RAPORT_res1)
+head(Anno)
+
+colnames(FULL_RAPORT_res1)
+colnames(master_table_ATAC)
+colnames(master_table_ATAC) <- c("ID","Chr","Start","End","Score","Conc_AVG","Conc_LPS","Conc_Control","Fold_LPS",
+                                 "p-value_LPS","FDR_LPS","width","annotation","geneChr","geneStart","geneEnd","geneLength",
+                                 "geneStrand","geneId","transcripitId","distanceToTSS","ENSEMBL","SYMBOL","GENENAME")
+
+FR2 <- FULL_RAPORT_res2[,c(6,8,9,10,11)]
+head(FR2)
+colnames(FR2) <- c("Conc_LPS","Fold_LPS","p-value_LPS","FDR_LPS","ID")
+master_table_ATAC <- merge(master_table_ATAC, FR2, by = "ID")
+
+FR3 <- FULL_RAPORT_res3[,c(6,8,9,10,11)]
+head(FR3)
+colnames(FR3) <- c("Conc_LPS_VitD","Fold_LPS_VitD","p-value_LPS_VitD","FDR_LPS_VitD","ID")
+master_table_ATAC <- merge(master_table_ATAC, FR3, by = "ID")
+
+
+
+
+colnames(master_table_ATAC)
+master_table_ATAC <- master_table_ATAC[,c(1:4,7:32)]
+master_table_ATAC <- master_table_ATAC[,c(1:4,10:22,6,5,7,8,9,23,24,25,26,27,28,29,30)]
+master_table_ATAC$VitD_sig <- "X"
+master_table_ATAC$LPS_sig <- "X"
+master_table_ATAC$LPS_VitD_sig <- "X"
+
+for(i in 1:nrow(master_table_ATAC)){
+  if(master_table_ATAC[i,1] %in% rownames(FULL_RAPORT_res3_db)){
+    master_table_ATAC[i,33] <- "YES"
+  }
+  else{
+    master_table_ATAC[i,33] <- "NO"
+  }
+}
+
+table(master_table_ATAC$LPS_VitD_sig)
+
+rownames(FULL_RAPORT_res1_db)
+
+
+head(master_table_ATAC)
+#End of table
+write.csv2(master_table_ATAC,"Table.S3_ATAC.csv")

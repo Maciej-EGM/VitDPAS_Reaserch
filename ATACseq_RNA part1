@@ -1,0 +1,455 @@
+################################################################################
+# 0. LIBRARIES
+################################################################################
+
+library(openxlsx)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(DESeq2)
+library(GenomicRanges)
+library(VennDiagram)
+library(grid)
+library(qqman)      # manhattan()
+
+
+################################################################################
+# 1. ATAC-seq: PER-SAMPLE SUMMARY OF REGION CHANGES (d1 - d0)
+################################################################################
+
+sample_ids <- gsub("d0$|d1$", "", grep("lane\\d+", names(Test_count_annot), value = TRUE))
+sample_ids <- unique(sample_ids)
+
+analyze_sample <- function(sample_id) {
+  d0_col <- paste0(sample_id, "d0")
+  d1_col <- paste0(sample_id, "d1")
+
+  delta <- Test_count_annot[[d1_col]] - Test_count_annot[[d0_col]]
+
+  category <- case_when(
+    delta > 1 ~ "Upregulated",
+    delta < -1 ~ "Downregulated",
+    TRUE ~ "No change"
+  )
+
+  as.data.frame(table(category)) %>%
+    rename(count = Freq) %>%
+    mutate(sample = sample_id)
+}
+
+all_samples_summary <- lapply(sample_ids, analyze_sample) %>%
+  bind_rows()
+
+# Rank samples by number of upregulated regions
+ranking <- all_samples_summary %>%
+  filter(category == "Upregulated") %>%
+  arrange(desc(count)) %>%
+  pull(sample)
+
+all_samples_summary$sample <- factor(all_samples_summary$sample, levels = ranking)
+
+# --- 1.1 Bar plot ---
+ggplot(all_samples_summary, aes(x = sample, y = count, fill = category)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(
+    title = "Number of regulated ATAC-seq regions per sample",
+    x = "Sample",
+    y = "Number of regions"
+  ) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  scale_fill_manual(values = c(
+    "Upregulated" = "firebrick",
+    "Downregulated" = "steelblue",
+    "No change" = "grey80"
+  ))
+
+
+################################################################################
+# 2. ATAC-seq: STRENGTH FILTER COLUMN (Consensus_H)
+################################################################################
+
+Consensus_H <- Consensus_H %>%
+  mutate(`All sample <10` = if_else(
+    rowSums(select(., matches("^Ind\\d+d[01]")) > 10) ==
+      length(select(., matches("^Ind\\d+d[01]"))),
+    "Yes", "No"
+  ))
+
+
+################################################################################
+# 3. ATAC-seq: DIFFERENTIAL ACCESSIBILITY WITH DESeq2 (d1 vs d0)
+################################################################################
+
+# 1. Add a peak_id column - here simply the row index
+Consensus_H <- Consensus_H %>%
+  mutate(peak_id = row_number())
+
+# 2. Select the count columns and build the count matrix
+# Counts are assumed to be all columns whose names contain "Ind" and end with "d0" or "d1"
+count_cols <- grep("^Ind.*d[01]$", colnames(Consensus_H), value = TRUE)
+
+count_data <- Consensus_H %>% select(all_of(count_cols))
+count_data <- round(count_data)
+rownames(count_data) <- Consensus_H$peak_id
+
+# 3. Build the metadata table (colData) - group is 'd0' or 'd1'
+# The day is extracted from the column name suffix
+coldata <- data.frame(
+  sample = colnames(count_data),
+  condition = ifelse(grepl("d0$", colnames(count_data)), "d0", "d1")
+)
+rownames(coldata) <- coldata$sample
+
+# 4. Create the DESeqDataSet object
+dds <- DESeqDataSetFromMatrix(countData = count_data,
+                              colData = coldata,
+                              design = ~ condition)
+
+# 5. Run DESeq2
+dds <- DESeq(dds)
+
+# 6. Extract results for the d1 vs d0 comparison
+res <- results(dds, contrast = c("condition", "d1", "d0"))
+
+# 7. Add the results to the original data frame
+res_df <- as.data.frame(res)
+res_df$peak_id <- rownames(res_df)
+
+Consensus_H <- left_join(Consensus_H, res_df, by = "peak_id")
+
+# Consensus_H now contains the test result columns (log2FoldChange, pvalue, padj, etc.)
+
+
+################################################################################
+# 4. ATAC-seq: OVERLAP OF PEAKS WITH RNA GENE WINDOWS
+################################################################################
+
+# --- 4.1 Gene windows: +/- 500 kb and +/- 500 bp ---
+gr500kp <- GRanges(
+  seqnames = RanjiniRNA$chromosome_name,
+  ranges = IRanges(
+    start = pmax(RanjiniRNA$start_position - 500000, 1),
+    end = RanjiniRNA$end_position + 500000
+  ))
+gr500bp <- GRanges(
+  seqnames = RanjiniRNA$chromosome_name,
+  ranges = IRanges(
+    start = pmax(RanjiniRNA$start_position - 500, 1),
+    end = RanjiniRNA$end_position + 500
+  ))
+
+# --- 4.2 Overlap analysis with RNA ---
+gr_H <- GRanges(
+  seqnames = Consensus_H$seqnames,
+  ranges = IRanges(start = Consensus_H$start, end = Consensus_H$end)
+)
+hits_merged <- findOverlaps(gr_H, gr500bp)
+Consensus_H$gr500bp <- FALSE
+Consensus_H$gr500bp[unique(queryHits(hits_merged))] <- TRUE
+
+# Overlap of gr_H with the 500 kb windows
+hits_merged2 <- findOverlaps(gr_H, gr500kp)
+Consensus_H$gr500kp <- FALSE
+Consensus_H$gr500kp[unique(queryHits(hits_merged2))] <- TRUE
+
+
+################################################################################
+# 5. ATAC-seq: PCA OF THE CONSENSUS MATRIX (d0 vs d1)
+################################################################################
+
+colnames(consensus_matrix)
+
+# Keep only columns containing "laneXXXd0" or "laneXXXd1"
+# All samples are assumed to be named "laneXXXd0" or "laneXXXd1"
+consensus_matrix_filtered <- consensus_matrix[, grepl("lane\\d+d[01]", colnames(consensus_matrix))]
+
+# Check that only valid samples remain
+colnames(consensus_matrix_filtered)
+
+# Transpose the data
+consensus_t <- t(consensus_matrix_filtered)
+
+# Run PCA
+pca_res <- prcomp(consensus_t, scale. = TRUE)
+
+# Prepare metadata
+sample_names <- rownames(consensus_t)
+condition <- ifelse(grepl("d0", sample_names), "d0", "d1")
+pca_df <- data.frame(pca_res$x[, 1:2], condition = factor(condition))
+
+# PCA plot
+ggplot(pca_df, aes(x = PC1, y = PC2, color = condition, label = rownames(pca_df))) +
+  geom_point(size = 3) +                            # draw points
+  geom_text(size = 3, vjust = -1) +                 # sample labels (optional)
+  labs(title = "PCA ATAC-seq", x = "PC1", y = "PC2") +
+  theme_minimal() +
+  theme(legend.position = "top")                    # legend at the top
+
+
+################################################################################
+# 6. ATAC-seq: CLUSTERING OF SAMPLES BY CHANGE (d1 - d0)
+################################################################################
+
+# --- 6.1 Select d0 and d1 columns ---
+d0_cols <- grep("d0$", colnames(Consensus_F), value = TRUE)
+d1_cols <- gsub("d0$", "d1", d0_cols)  # pairs are assumed to exist
+
+# Sanity check
+stopifnot(all(d1_cols %in% colnames(Consensus_F)))
+
+# --- 6.2 Log2 transformation ---
+log_d0 <- log2(Consensus_F[, d0_cols] + 1)
+log_d1 <- log2(Consensus_F[, d1_cols] + 1)
+
+# --- 6.3 Compute differences d1 - d0 ---
+delta_mat <- log_d1 - log_d0
+
+# --- 6.4 Simplified column names: laneXXX (without d0/d1) ---
+sample_names <- gsub("d0$", "", d0_cols)
+colnames(delta_mat) <- sample_names
+
+# --- 6.5 Row-wise standardisation ---
+scaled_delta <- t(scale(t(delta_mat)))  # Z-score across rows
+
+# --- 6.6 Hierarchical clustering ---
+dist_mat <- dist(t(scaled_delta))  # samples in columns
+hc <- hclust(dist_mat, method = "ward.D2")
+
+# Dendrogram
+plot(hc, main = "Clustering based on expression changes (d1 - d0)", xlab = "", sub = "")
+
+# --- 6.7 K-means clustering ---
+set.seed(123)
+k <- 3
+kmeans_res <- kmeans(t(scaled_delta), centers = k)
+cluster_labels <- factor(kmeans_res$cluster)
+
+# --- 6.8 PCA ---
+pca <- prcomp(t(scaled_delta), scale. = FALSE)
+pca_df <- data.frame(pca$x[, 1:2])
+pca_df$sample <- sample_names
+pca_df$cluster <- cluster_labels
+
+# --- 6.9 PCA plot ---
+ggplot(pca_df, aes(PC1, PC2, color = cluster, label = sample)) +
+  geom_point(size = 3) +
+  geom_text(vjust = -1, size = 3) +
+  labs(title = "PCA of Expression Changes (d1 - d0)",
+       x = "PC1", y = "PC2") +
+  theme_minimal()
+
+# --- 6.10 PCA plot with k-means clusters labelled high / mid / low ---
+
+# Prepare the data
+pca_plot_df <- as.data.frame(pca_res$x)
+rownames(pca_plot_df) <- rownames(diff_samples)
+pca_plot_df$cluster <- factor(kmeans_res$cluster, levels = 1:3, labels = c("high","mid","low"))
+pca_plot_df$sample <- rownames(pca_plot_df)  # sample names used as labels
+
+ggplot(pca_plot_df, aes(x = PC1, y = PC2, color = cluster)) +
+  geom_point(size = 3, alpha = 0.8) +
+  geom_text(aes(label = sample), vjust = -0.6, size = 3, show.legend = FALSE) +  # show.legend=FALSE removes the "a" glyph
+  scale_color_manual(
+    values = c("high" = "#66c2a5", "mid" = "#fc8d62", "low" = "#8da0cb")
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11),
+    panel.grid = element_blank(),
+    axis.line = element_line(size = 0.8, color = "black")
+  ) +
+  ggtitle("kmeans clustering")
+
+
+################################################################################
+# 7. COHORT FIGURES
+################################################################################
+
+# --- 7.1 Manhattan plot (average counts at day 0) ---
+
+# Day 0 columns
+day0_cols <- grep("d0$", colnames(Consensus_high), value = TRUE)
+Consensus_high$avg_d0 <- rowMeans(Consensus_high[, day0_cols], na.rm = TRUE)
+
+# Chromosome mapping
+chrom_map <- setNames(1:24, c(paste0("chr", 1:22), "chrX", "chrY"))
+
+# Plot data
+manhattan_df_day0 <- Consensus_high %>%
+  mutate(
+    SNP = paste0(seqnames, ":", start),
+    CHR = chrom_map[seqnames],
+    BP = start,
+    P = avg_d0
+  ) %>%
+  filter(!is.na(CHR))
+
+# Colours
+my_colors <- rep(c("#0096d6", "#d76067"), length.out=length(unique(manhattan_df_day0$CHR)))
+
+# Graphic style - thicker axes
+par(lwd = 2)  # thicker axis lines
+
+# Plot
+manhattan(manhattan_df_day0, chr="CHR", bp="BP", p="P", snp="SNP", logp=FALSE,
+          ylab="Average Counts Day 0", xlab="Chromosome", ylim=c(0, 500), col=my_colors)
+
+# --- 7.2 Pairwise Venn: Merged vs Consensus_F ---
+
+# Overlap-based version
+overlaps <- findOverlaps(gr_merged, gr_consensus_f)
+
+area1 <- length(gr_merged)
+area2 <- length(gr_consensus)
+cross_area <- length(unique(queryHits(overlaps)))
+
+venn.plot <- draw.pairwise.venn(
+  area1 = area1,
+  area2 = area2,
+  cross.area = cross_area,
+  category = c("Merged", "Consensus_F"),
+  fill = c("skyblue", "orange"),
+  alpha = 0.5,
+  cat.cex = 1.5,
+  scaled = TRUE
+)
+
+grid.draw(venn.plot)
+
+# --- 7.3 Triple Venn: L / M / H consensus peak sets ---
+
+# Convert tables to GRanges
+gr_L <- GRanges(seqnames = Consensus_L_filtered$seqnames,
+                ranges = IRanges(start = Consensus_L_filtered$start,
+                                 end = Consensus_L_filtered$end))
+
+gr_M <- GRanges(seqnames = Consensus_M_filtered$seqnames,
+                ranges = IRanges(start = Consensus_M_filtered$start,
+                                 end = Consensus_M_filtered$end))
+
+gr_H <- GRanges(seqnames = Consensus_H_filtered$seqnames,
+                ranges = IRanges(start = Consensus_H_filtered$start,
+                                 end = Consensus_H_filtered$end))
+
+# Count overlaps
+n_L <- length(gr_L)
+n_M <- length(gr_M)
+n_H <- length(gr_H)
+
+n_LM <- length(findOverlaps(gr_L, gr_M, ignore.strand=TRUE))
+n_LH <- length(findOverlaps(gr_L, gr_H, ignore.strand=TRUE))
+n_MH <- length(findOverlaps(gr_M, gr_H, ignore.strand=TRUE))
+
+# Overlap of all three
+# findOverlaps returns Hits objects, so count the unique L regions that overlap both M and H
+hits_LM <- findOverlaps(gr_L, gr_M, ignore.strand=TRUE)
+hits_LH <- findOverlaps(gr_L, gr_H, ignore.strand=TRUE)
+hits_L_M_H <- intersect(queryHits(hits_LM), queryHits(hits_LH))
+n_LMH <- length(hits_L_M_H)
+
+# Draw the Venn diagram
+venn.plot <- draw.triple.venn(
+  area1 = n_L,
+  area2 = n_M,
+  area3 = n_H,
+  n12 = n_LM,
+  n23 = n_MH,
+  n13 = n_LH,
+  n123 = n_LMH,
+  category = c("L", "M", "H"),
+  fill = c("red", "green", "blue"),
+  lty = "blank",
+  cex = 2,
+  cat.cex = 2,
+  cat.pos = 0
+)
+
+
+################################################################################
+# 8. RNA-seq ANALYSIS
+################################################################################
+
+# --- 8.1 Sample metadata ---
+
+# Sample names
+sample_names <- colnames(count_data)
+
+# Condition (d0 vs d1)
+condition <- ifelse(grepl("^d0_", sample_names), "d0", "d1")
+
+# Individual (Ind01, Ind02, etc.)
+individual <- gsub(".*Ind", "Ind", sample_names)
+
+col_data <- data.frame(
+  row.names   = sample_names,
+  condition   = factor(condition, levels = c("d0", "d1")),
+  individual  = factor(individual)  # enables paired analysis
+)
+
+# --- 8.2 Paired DESeq2 (d1 vs d0) ---
+dds <- DESeqDataSetFromMatrix(countData = count_data,
+                              colData   = col_data,
+                              design    = ~ individual + condition)
+
+dds <- DESeq(dds)
+res <- results(dds, contrast = c("condition", "d1", "d0"))
+
+# Shrink log2FC for better interpretability
+res <- lfcShrink(dds, coef = "condition_d1_vs_d0", type = "apeglm")
+
+# --- 8.3 Export results ---
+
+# Sort by padj
+resOrdered <- res[order(res$padj), ]
+# Convert to a data frame with a "Gene" column
+res_RNA_df <- as.data.frame(resOrdered)
+res_RNA_df$Gene <- rownames(resOrdered)
+res_RNA_df <- res_RNA_df %>% select(Gene, everything())
+
+# Save to Excel
+write.xlsx(res_RNA_df, file = "res_RNA.xlsx", rowNames = FALSE)
+
+# --- 8.4 Merge DESeq2 results into the per-group RNA tables ---
+RNA_M2 <- merge(RNA_M2, RNAres_M,
+                    by.x = "hgnc_symbol",
+                    by.y = "Gene",
+                    all.x = TRUE)
+RNA_H2 <- merge(RNA_H2, RNAres_H,
+                    by.x = "hgnc_symbol",
+                    by.y = "Gene",
+                    all.x = TRUE)
+RNA_L2 <- merge(RNA_L2, RNAres_L,
+                    by.x = "hgnc_symbol",
+                    by.y = "Gene",
+                    all.x = TRUE)
+
+# --- 8.5 Venn diagram of significant genes (padj < 0.05) ---
+
+# Filter genes by padj < 0.05
+genes_L2 <- RNA_L2$hgnc_symbol[RNA_L2$padj < 0.05]
+genes_M2 <- RNA_M2$hgnc_symbol[RNA_M2$padj < 0.05]
+genes_H2  <- RNA_H2$hgnc_symbol[RNA_H2$padj < 0.05]
+
+# Build the list for VennDiagram
+gene_list <- list(L2 = genes_L2, M2 = genes_M2, H2 = genes_H2)
+
+# Build the Venn diagram with adjusted colours and label positions
+venn.plot <- venn.diagram(
+  x = gene_list,
+  filename = NULL,
+  fill = c("blue", "green", "red"),  # L2 - blue, M2 - green, H2 - red
+  alpha = 0.5,
+  cex = 2,
+  cat.cex = 1.5,
+  cat.col = c("blue", "green", "red"),
+  cat.pos = c(-20, 20, 180),        # shift labels so they do not overlap
+  cat.dist = c(0.05, 0.05, 0.05),   # distance from the circle
+  margin = 0.1
+)
+
+# Display the diagram
+grid.newpage()
+grid.draw(venn.plot)
